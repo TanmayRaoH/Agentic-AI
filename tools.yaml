@@ -1,0 +1,7 @@
+tools:
+  fs_read_file:    { labels: [private], risk: low, reviewed: true, arg_kinds: { path: path }, path_roots: [./sandbox] }
+  fs_write_file:   { labels: [], risk: high, reviewed: true, arg_kinds: { path: path }, path_roots: [./sandbox/out] }
+  fs_delete_file:  { labels: [], risk: critical, reviewed: true, arg_kinds: { path: path }, path_roots: [./sandbox/out] }
+  web_fetch:       { labels: [untrusted, sink], risk: medium, reviewed: true, arg_kinds: { url: url }, dest_arg: url }
+  mail_send_email: { labels: [sink], risk: high, reviewed: true, arg_kinds: { to: email }, dest_arg: to }
+  notes_read:      { labels: [private], risk: low, reviewed: true }

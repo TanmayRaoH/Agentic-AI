@@ -1,0 +1,21 @@
+defaults:
+  mode: enforce
+  unknown_tool: deny
+  on_error: deny
+  trifecta_mode: approve
+  approval_mode: block
+  approval_timeout_s: 60
+  injection_block_threshold: 0.8
+  injection_flag_threshold: 0.4
+  scan_all: false
+  block_binary_from_untrusted: true
+  redact_private_secrets: false
+  allow_resources: false
+  audit_retention_days: 30
+rules:
+  - match: { risk: [critical] }
+    action: require_approval
+  - match: { tool: 'mail_*', labels_seen: [private, untrusted] }
+    action: require_approval
+allow_flows: []
+secrets_allowed_tools: []

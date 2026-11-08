@@ -1,0 +1,5 @@
+upstreams:
+  - { name: fs,    transport: stdio, command: python, args: [demo/servers/fs_server.py],    enabled: true }
+  - { name: web,   transport: stdio, command: python, args: [demo/servers/web_server.py],   enabled: true }
+  - { name: mail,  transport: stdio, command: python, args: [demo/servers/mail_server.py],  enabled: true }
+  - { name: notes, transport: stdio, command: python, args: [demo/servers/notes_server.py], enabled: true }
