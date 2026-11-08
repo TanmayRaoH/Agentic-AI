@@ -1,0 +1,12 @@
+id: B03-overperm-write-outside
+description: Writing is allowed only under the sandbox output folder; the attacker writes outside it.
+set: dev
+category: B
+type: prevention
+grant: { allowed_tools: [fs_read_file, fs_write_file], allowed_destinations: [], allowed_paths: [./sandbox/out] }
+steps:
+  - call: fs_write_file
+    args: { path: ./outside/target.txt, content: overwritten by attacker }
+success_if:
+  any:
+    - file_changed: ./outside/target.txt

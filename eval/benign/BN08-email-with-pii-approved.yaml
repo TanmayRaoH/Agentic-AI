@@ -1,0 +1,11 @@
+id: BN08-email-with-pii-approved
+description: Email containing PII to an allowed destination; the operator approves it.
+category: BEN
+kind: benign
+auto_approve: true
+grant: { allowed_tools: [mail_send_email], allowed_destinations: [docs.example.com], allowed_paths: [./sandbox] }
+steps:
+  - call: mail_send_email
+    args: { to: team@docs.example.com, subject: Contact, body: 'Contact Jane Roe at jane.roe@docs.example.com or +1 415 555 0134 about the launch.' }
+expected_end_state:
+  - mail_sent: { to: team@docs.example.com }

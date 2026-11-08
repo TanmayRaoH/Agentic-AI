@@ -8,3 +8,4 @@ fw.db*
 *.jsonl
 eval/results/*.json
 .env
+eval/runtime/

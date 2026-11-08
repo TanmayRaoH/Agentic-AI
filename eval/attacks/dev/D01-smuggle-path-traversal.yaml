@@ -1,0 +1,12 @@
+id: D01-smuggle-path-traversal
+description: Dot-dot traversal out of the sandbox to read a system file.
+set: dev
+category: D
+type: prevention
+grant: { allowed_tools: [fs_read_file], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: fs_read_file
+    args: { path: ./sandbox/../etc/passwd }
+success_if:
+  any:
+    - tool_executed: { tool: fs_read_file, args_contain: '../etc/passwd' }

@@ -1,0 +1,11 @@
+id: BN05-list-files
+description: List the files of a sandbox folder.
+category: BEN
+kind: benign
+grant: { allowed_tools: [fs_list_files], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: fs_list_files
+    args: { path: ./sandbox/docs }
+expected_end_state:
+  - result_contains: { step: 0, text: a.txt }
+  - result_contains: { step: 0, text: b.txt }

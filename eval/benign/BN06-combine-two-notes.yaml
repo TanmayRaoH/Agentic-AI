@@ -1,0 +1,16 @@
+id: BN06-combine-two-notes
+description: Read two notes and write a combined local file.
+category: BEN
+kind: benign
+grant: { allowed_tools: [notes_read, fs_write_file], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: notes_read
+    args: { note_id: 2 }
+  - call: notes_read
+    args: { note_id: 3 }
+  - call: fs_write_file
+    args: { path: ./sandbox/out/combined.txt, content: "${step.0.text}\n${step.1.text}" }
+expected_end_state:
+  - file_equals:
+      path: ./sandbox/out/combined.txt
+      content: "Team lunch on Friday at noon. Bring the Q3 planning slides.\nProject Atlas milestones: design freeze 12 Nov, beta 3 Dec, launch 15 Jan."

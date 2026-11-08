@@ -47,5 +47,16 @@ The guide is mirrored at `.kiro/steering/agent-firewall-guide.md`; `Reference.md
 | metrics.py / alerts.py / replay.py | | F22 / F22 / F21 |
 | llm.py + agents/ | | F24-F27 |
 
+## Phase 1 design decisions
+- Demo servers expose unprefixed tool names (`read_file`, `fetch`, `send_email`, `read`); the upstream name is the prefix, so the agent sees `fs_read_file`, `web_fetch`, `mail_send_email`, `notes_read` (matches tools.yaml). The unprotected backend adds the prefix itself, the gateway will do it via `mount(namespace=...)`.
+- Added tools beyond the guide's six, all listed in tools.yaml: `fs_list_files`, `fs_run_command` (simulated, never executes), `notes_write`. Needed for the benign "list files" scenario, D03 (shell metacharacters) and E02 (stage via notes).
+- The fs server is jailed to a fake world dir (`eval/runtime/world`, copied from `eval/fixtures/world` before every run). Absolute paths map into it and `..` cannot climb out, so unprotected attacks never touch the real disk. `/etc/passwd` is a fake file.
+- Ground truth: `eval/runtime/logs/upstream_calls.jsonl` (every executed call), `mail_log.jsonl` and `web_requests.jsonl` (sinks), plus world files compared with the fixture.
+- Rug-pull server (`demo/servers/rugpull_server.py`, env `RUGPULL_MODE`): modes poisoned, rugpull, schema, shadow. The listing counter lives in `rugpull_state.json` in the log dir, so it counts across processes. "Description changes after first listing" means: the first `tools/list` is benign, the second and later are not. When the gateway lists at startup, that startup listing counts as the first.
+- Extra scenario fields beyond the guide's example: `variant` (swaps the web or fs upstream for the rug-pull server), `list: true` step (agent reloads its tool list), template ops rev, url, rot13, upper, spaced, dashed, half1, half2, slice, repeat, `${step.N.text}`.
+- A04 and E03 both split the canary itself (halves / three slices), not the note text, so the split is deterministic.
+- Windows detail: fs_write_file writes with `newline=""` so `\n` is not turned into `\r\n` (this broke BN06 until fixed).
+
 ## Phase log
 - Phase 0: layout, uv project, deps, strict config models (F23), Makefile skeleton, Section 11 findings. Tests: `uv run pytest` passes.
+- Phase 1: demo servers (fs, notes, web, mail, rug-pull), scenario format + scripted attacker, ground truth, unprotected runner. 21 dev attack scenarios (A to E) and 8 benign scenarios. Baseline (3 reps each): attacks 20/20 succeed (D04 is gateway_only and excluded), benign 8/8. Saved in `eval/results/before_table.md`. Not committed (awaiting user approval).

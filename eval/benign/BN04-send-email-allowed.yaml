@@ -1,0 +1,10 @@
+id: BN04-send-email-allowed
+description: Send a status email to an allowed destination under a grant that permits it.
+category: BEN
+kind: benign
+grant: { allowed_tools: [mail_send_email], allowed_destinations: [docs.example.com], allowed_paths: [./sandbox] }
+steps:
+  - call: mail_send_email
+    args: { to: team@docs.example.com, subject: Status, body: The launch is on schedule. }
+expected_end_state:
+  - mail_sent: { to: team@docs.example.com }

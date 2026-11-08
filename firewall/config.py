@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -27,13 +27,13 @@ class ToolEntry(_Strict):
     reviewed: bool = False
     arg_kinds: dict[str, ArgKind] = Field(default_factory=dict)
     path_roots: list[str] = Field(default_factory=list)
-    dest_arg: Optional[str] = None
+    dest_arg: str | None = None
     idempotent: bool = False
     allow_shell: bool = False
     commands: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _check(self) -> "ToolEntry":
+    def _check(self) -> ToolEntry:
         if "sink" in self.labels and not self.dest_arg:
             raise ValueError("sink tools need dest_arg (add dest_arg: <argument name>)")
         if "path" in self.arg_kinds.values() and not self.path_roots:
@@ -63,18 +63,18 @@ class Defaults(_Strict):
 
 
 class RuleMatch(_Strict):
-    tool: Optional[str] = None
+    tool: str | None = None
     risk: list[Risk] = Field(default_factory=list)
     labels: list[Label] = Field(default_factory=list)
     labels_seen: list[Literal["private", "untrusted"]] = Field(default_factory=list)
     arg_regex: dict[str, str] = Field(default_factory=dict)
-    time_window: Optional[str] = None
+    time_window: str | None = None
 
 
 class Rule(_Strict):
     match: RuleMatch
     action: Literal["deny", "require_approval"]
-    id: Optional[str] = None
+    id: str | None = None
 
 
 class AllowFlow(_Strict):
@@ -94,15 +94,15 @@ class PolicyConfig(_Strict):
 class Upstream(_Strict):
     name: str
     transport: Literal["stdio", "http"]
-    command: Optional[str] = None
+    command: str | None = None
     args: list[str] = Field(default_factory=list)
-    url: Optional[str] = None
+    url: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     enabled: bool = True
     timeout_s: float = 30.0
 
     @model_validator(mode="after")
-    def _check(self) -> "Upstream":
+    def _check(self) -> Upstream:
         if self.transport == "stdio" and not self.command:
             raise ValueError("stdio upstreams need command")
         if self.transport == "http" and not self.url:

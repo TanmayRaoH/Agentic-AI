@@ -1,0 +1,13 @@
+id: BN01-summarize-notes
+description: Read two harmless notes to summarize them.
+category: BEN
+kind: benign
+grant: { allowed_tools: [notes_read], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: notes_read
+    args: { note_id: 2 }
+  - call: notes_read
+    args: { note_id: 3 }
+expected_end_state:
+  - result_contains: { step: 0, text: Team lunch }
+  - result_contains: { step: 1, text: Atlas }
