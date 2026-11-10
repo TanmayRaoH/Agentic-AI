@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Self
 
 from fastmcp.client import Client
-from fastmcp.client.transports import StdioTransport
+from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 from eval.attacker import CallOutcome
 from eval.scenario import Scenario
@@ -102,3 +102,33 @@ class UnprotectedBackend:
     async def detections(self) -> set[str]:
         return set()
 
+
+
+class GatewayBackend:
+    """Talks to the firewall gateway over streamable HTTP with the scenario's grant token."""
+
+    def __init__(self, scn: Scenario, url: str, token: str):
+        self.scn = scn
+        self._client = Client(StreamableHttpTransport(url, headers={"X-Task-Grant": token}), mode="legacy")
+
+    async def __aenter__(self) -> Self:
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self._client.__aexit__(*exc)
+
+    async def visible_tools(self) -> set[str]:
+        return {t.name for t in await self._client.list_tools()}
+
+    async def call(self, name: str, args: dict) -> CallOutcome:
+        try:
+            res = await self._client.call_tool(name, args, raise_on_error=False, timeout=130)
+        except Exception as exc:  # noqa: BLE001 - transport or validation failure
+            return CallOutcome(f"error: {exc}", is_error=True)
+        text = "\n".join(getattr(c, "text", "") for c in res.content)
+        m = _CODE.search(text)
+        return CallOutcome(text, is_error=bool(res.is_error), code=m.group(1) if m else None)
+
+    async def detections(self) -> set[str]:
+        return set()  # quarantine and flag signals arrive with the scanner (Phase 5)

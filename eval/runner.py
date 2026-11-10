@@ -1,4 +1,4 @@
-"""Evaluation runner (F29). Phase 1: unprotected mode only.
+"""Evaluation runner (F29). Modes: unprotected (direct), monitor and enforce (through the gateway).
 
 Usage: uv run python -m eval.runner --modes unprotected [--sets dev] [--reps 3] [--only A02]
 """
@@ -17,6 +17,7 @@ from rich.table import Table
 
 from eval.attacker import run_steps
 from eval.backends import LOGS, RUNTIME, UnprotectedBackend
+from eval.gateway_harness import GatewayManager
 from eval.ground_truth import FIXTURE_WORLD, WORLD, eval_cond
 from eval.scenario import EVAL_DIR, Scenario, default_dirs, load_scenarios
 
@@ -31,18 +32,20 @@ def reset_environment() -> None:
     LOGS.mkdir(parents=True, exist_ok=True)
 
 
-def make_backend(mode: str, scn: Scenario):
-    if mode == "unprotected":
-        return UnprotectedBackend(scn)
-    raise NotImplementedError(f"mode {mode!r} needs the gateway (Phase 2 onward)")
-
-
-async def run_once(scn: Scenario, mode: str) -> dict:
+async def run_once(scn: Scenario, mode: str, manager: GatewayManager | None) -> dict:
     reset_environment()
     t0 = time.perf_counter()
-    async with make_backend(mode, scn) as backend:
+    gw = grant_id = None
+    if mode == "unprotected":
+        backend = UnprotectedBackend(scn)
+    else:
+        backend, gw, grant_id = await manager.backend_for(scn)
+    async with backend:
         records, ctx = await run_steps(scn, backend)
         detections = await backend.detections()
+    audit_rows = None
+    if gw is not None:
+        audit_rows = len(await gw.store.query_audit(grant_id=grant_id, phase="call", limit=10000))
     if scn.kind == "benign":
         success = all(eval_cond(c, ctx) for c in scn.expected_end_state)
     elif scn.type == "detection":
@@ -52,6 +55,7 @@ async def run_once(scn: Scenario, mode: str) -> dict:
     return {
         "success": success,
         "seconds": round(time.perf_counter() - t0, 2),
+        "audit_call_rows": audit_rows,
         "steps": [
             {
                 "i": r.index,
@@ -66,8 +70,8 @@ async def run_once(scn: Scenario, mode: str) -> dict:
     }
 
 
-async def run_scenario(scn: Scenario, mode: str, reps: int) -> dict:
-    runs = [await run_once(scn, mode) for _ in range(reps)]
+async def run_scenario(scn: Scenario, mode: str, reps: int, manager: GatewayManager | None) -> dict:
+    runs = [await run_once(scn, mode, manager) for _ in range(reps)]
     wins = sum(r["success"] for r in runs)
     return {
         "id": scn.id,
@@ -138,9 +142,14 @@ async def main_async(args) -> int:
     (EVAL_DIR / "results").mkdir(exist_ok=True)
     for mode in args.modes:
         results = []
-        for scn in scenarios:
-            results.append(await run_scenario(scn, mode, args.reps))
-            console.print(f"  {scn.id}: {'success' if results[-1]['majority_success'] else 'no'}", highlight=False)
+        manager = GatewayManager(mode) if mode != "unprotected" else None
+        try:
+            for scn in scenarios:
+                results.append(await run_scenario(scn, mode, args.reps, manager))
+                console.print(f"  {scn.id}: {'success' if results[-1]['majority_success'] else 'no'}", highlight=False)
+        finally:
+            if manager is not None:
+                await manager.stop()
         summary = summarize(results)
         print_report(mode, results, summary)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
