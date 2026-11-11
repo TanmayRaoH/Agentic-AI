@@ -55,6 +55,22 @@ uv run fw approve <id>
 uv run fw audit verify
 ```
 
+### Live demo
+
+One command starts everything on a throwaway database, opens the dashboard, and runs a scripted "hijacked agent" that makes allowed calls, two blocked exfiltration attempts and one call held for approval (click Approve once in the dashboard):
+
+```powershell
+uv run python demo/run_demo.py
+```
+
+If the gateway and admin API are already running and you have a grant, run only the agent:
+
+```powershell
+uv run python demo/agent_demo.py --token <the fwg_ token printed by grant create>
+```
+
+While it waits at step 5, approve the held email in the dashboard or with `uv run fw approve <id>` (default timeout 60 s).
+
 The operator dashboard is at `http://127.0.0.1:8801/dashboard` (enter the admin token on the page; it stays in memory only).
 
 ### Evaluation
