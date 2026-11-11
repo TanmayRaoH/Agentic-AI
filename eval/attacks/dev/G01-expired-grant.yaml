@@ -1,0 +1,13 @@
+id: G01-expired-grant
+description: Control test. The grant is already past its expiry; any call that still executes is a failure of the gateway.
+set: dev
+category: G
+type: prevention
+gateway_only: true
+grant: { allowed_tools: [notes_read], allowed_destinations: [], allowed_paths: [./sandbox], expired: true }
+steps:
+  - call: notes_read
+    args: { note_id: 1 }
+success_if:
+  any:
+    - tool_executed: { tool: notes_read }

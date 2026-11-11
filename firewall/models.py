@@ -65,3 +65,5 @@ class ToolMeta:
     arg_kinds: dict[str, str]
     path_roots: list[str]
     dest_arg: str | None
+    commands: list[str] = field(default_factory=list)
+    allow_shell: bool = False

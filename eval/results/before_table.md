@@ -1,6 +1,6 @@
 # Before table (unprotected baseline)
 
-Generated 2026-11-08T17:52:36+00:00
+Generated 2026-11-11T07:40:43+00:00
 
 | Category | Attacks succeeded | Total |
 |---|---|---|

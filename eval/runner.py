@@ -89,6 +89,8 @@ async def run_scenario(scn: Scenario, mode: str, reps: int, manager: GatewayMana
 def summarize(results: list[dict]) -> dict:
     attacks = [r for r in results if r["kind"] == "attack" and r["type"] == "prevention" and not r["gateway_only"]]
     benign = [r for r in results if r["kind"] == "benign"]
+    controls = [r for r in results if r["kind"] == "attack" and r["type"] == "prevention" and r["gateway_only"]]
+    detection = [r for r in results if r["kind"] == "attack" and r["type"] == "detection"]
     by_cat: dict[str, list[bool]] = defaultdict(list)
     for r in attacks:
         by_cat[r["category"]].append(r["majority_success"])
@@ -100,6 +102,11 @@ def summarize(results: list[dict]) -> dict:
         "benign_success": sum(r["majority_success"] for r in benign),
         "by_category": {c: (sum(v), len(v)) for c, v in sorted(by_cat.items())},
         "nondeterministic": [r["id"] for r in results if r["nondeterministic"]],
+        # gateway_only control tests are reported separately; "succeeded" means the control was NOT held
+        "controls": {r["id"]: r["majority_success"] for r in controls},
+        # detection scenarios are reported as detection rates, never as attack success
+        "detection_total": len(detection),
+        "detection_detected": sum(r["majority_success"] for r in detection),
     }
 
 
@@ -108,9 +115,12 @@ def print_report(mode: str, results: list[dict], summary: dict) -> None:
     for col in ("scenario", "cat", "kind", "gateway_only", "outcome"):
         t.add_column(col)
     for r in results:
-        outcome = ("OK" if r["majority_success"] else "FAILED") if r["kind"] == "benign" else (
-            "attack succeeded" if r["majority_success"] else "attack failed"
-        )
+        if r["kind"] == "benign":
+            outcome = "OK" if r["majority_success"] else "FAILED"
+        elif r["type"] == "detection":
+            outcome = "detected" if r["majority_success"] else "missed"
+        else:
+            outcome = "attack succeeded" if r["majority_success"] else "attack failed"
         t.add_row(r["id"], r["category"], r["kind"], str(r["gateway_only"]), outcome + (" (flaky)" if r["nondeterministic"] else ""))
     console.print(t)
     rate = summary["attack_success_rate"]
@@ -119,6 +129,11 @@ def print_report(mode: str, results: list[dict], summary: dict) -> None:
         + (f" = {rate:.0%}" if rate is not None else "")
         + f"   Benign success: {summary['benign_success']}/{summary['benign_total']}"
     )
+    if summary["detection_total"]:
+        console.print(f"Detection scenarios flagged or quarantined: {summary['detection_detected']}/{summary['detection_total']}")
+    if summary["controls"]:
+        held = sum(1 for ok in summary["controls"].values() if not ok)
+        console.print(f"Gateway-only controls held: {held}/{len(summary['controls'])}")
     console.print("By category (succeeded/total): " + ", ".join(f"{c}={a}/{b}" for c, (a, b) in summary["by_category"].items()))
 
 

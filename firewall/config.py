@@ -60,6 +60,12 @@ class Defaults(_Strict):
     redact_private_secrets: bool = False
     allow_resources: bool = False
     audit_retention_days: int = 30
+    # F08: per-grant limits (token bucket, identical-call loop breaker, circuit breaker)
+    rate_limit_per_min: int = 30
+    rate_burst: int = 10
+    loop_threshold: int = 3
+    loop_window_s: int = 60
+    suspend_after_denies: int = 5
 
 
 class RuleMatch(_Strict):
@@ -69,6 +75,22 @@ class RuleMatch(_Strict):
     labels_seen: list[Literal["private", "untrusted"]] = Field(default_factory=list)
     arg_regex: dict[str, str] = Field(default_factory=dict)
     time_window: str | None = None
+
+
+    @model_validator(mode="after")
+    def _check(self) -> RuleMatch:
+        import re as _re
+
+        for name, pattern in self.arg_regex.items():
+            try:
+                _re.compile(pattern)
+            except _re.error as exc:
+                raise ValueError(f"arg_regex for {name!r} is not a valid regular expression: {exc}") from None
+        if self.time_window is not None:
+            parts = self.time_window.split("-")
+            if len(parts) != 2 or not all(p.isdigit() and 0 <= int(p) <= 24 for p in parts):
+                raise ValueError("time_window must look like 9-17 (local hours 0 to 24)")
+        return self
 
 
 class Rule(_Strict):
@@ -114,17 +136,35 @@ class UpstreamsConfig(_Strict):
     upstreams: list[Upstream]
 
 
+_HINTS = {
+    "extra_forbidden": "unknown key; check the spelling or remove it",
+    "literal_error": "value not allowed; use one of the permitted values listed in the message",
+    "missing": "required key is missing; add it",
+    "value_error": "fix the value as described in the message",
+    "int_parsing": "expected a whole number",
+    "bool_parsing": "expected true or false",
+    "string_type": "expected text; put quotes around it",
+    "list_type": "expected a list, e.g. [a, b]",
+    "dict_type": "expected a mapping, e.g. { key: value }",
+}
+
+
 def _load(path: Path, model):
+    path = Path(path)
     try:
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return model.model_validate(data)
     except FileNotFoundError:
-        raise ConfigError(f"{path}: file not found; create it (see Reference.md Section 6)")
+        raise ConfigError(f"{path}: file not found; create it (see Reference.md Section 6)") from None
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{path}: invalid YAML: {exc}")
+        raise ConfigError(f"{path}: invalid YAML ({exc}); fix the syntax at the position shown") from None
     except ValidationError as exc:
-        lines = [f"{path}: {'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
-        raise ConfigError("\n".join(lines))
+        lines = []
+        for e in exc.errors():
+            key = ".".join(str(p) for p in e["loc"]) or "(top level)"
+            hint = _HINTS.get(e["type"], _HINTS["value_error"] if e["type"].startswith("value_error") else "fix this value")
+            lines.append(f"{path}: key '{key}': {e['msg']}. Fix: {hint}")
+        raise ConfigError("\n".join(lines)) from None
 
 
 def load_tools(path: Path = Path("tools.yaml")) -> ToolsConfig:
@@ -137,3 +177,14 @@ def load_policy(path: Path = Path("policy.yaml")) -> PolicyConfig:
 
 def load_upstreams(path: Path = Path("upstreams.yaml")) -> UpstreamsConfig:
     return _load(path, UpstreamsConfig)
+
+
+def config_version(*paths: Path) -> str:
+    """Short digest of the config files, shown by /health."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for p in paths:
+        p = Path(p)
+        h.update(p.read_bytes() if p.exists() else b"")
+    return h.hexdigest()[:12]

@@ -32,11 +32,13 @@ CREATE TABLE IF NOT EXISTS fingerprints(
   grant_id TEXT, source_tool TEXT, hash INTEGER, created_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_fp ON fingerprints(grant_id, hash);
 CREATE TABLE IF NOT EXISTS exact_tokens(
-  grant_id TEXT, source_tool TEXT, token_hash TEXT, created_at TEXT);
+  grant_id TEXT, source_tool TEXT, token_hash TEXT, created_at TEXT, length INTEGER, poly INTEGER);
+CREATE INDEX IF NOT EXISTS idx_tokens ON exact_tokens(grant_id);
 CREATE TABLE IF NOT EXISTS egress_buffer(grant_id TEXT PRIMARY KEY, text TEXT);
 CREATE TABLE IF NOT EXISTS pins(
   upstream TEXT, tool TEXT, hash TEXT, state TEXT, description_snapshot TEXT,
-  first_seen TEXT, changed_at TEXT, PRIMARY KEY(upstream, tool));
+  first_seen TEXT, changed_at TEXT, new_hash TEXT, new_snapshot TEXT, reasons TEXT,
+  PRIMARY KEY(upstream, tool));
 CREATE TABLE IF NOT EXISTS approvals(
   id TEXT PRIMARY KEY, grant_id TEXT, session_id TEXT, tool TEXT, args_masked TEXT,
   args_encrypted BLOB, args_hash TEXT, reason_codes TEXT, approval_scope TEXT,
@@ -77,6 +79,7 @@ class Store:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")  # the admin API is a second process on the same file
         await self._db.executescript(SCHEMA)
         await self._db.commit()
         return self
@@ -141,6 +144,47 @@ class Store:
         )
         return n == 1
 
+    async def set_grant_expiry(self, grant_id: str, expires_at: str) -> None:
+        """Test and harness helper (e.g. to build an already expired grant)."""
+        await self._run("UPDATE grants SET expires_at=? WHERE id=?", (expires_at, grant_id))
+
+    # ---------------- approvals (queue rows; the wait/encrypt flow arrives in Phase 6) ----------------
+    async def insert_approval(self, a: dict) -> None:
+        await self._run(
+            "INSERT INTO approvals(id, grant_id, session_id, tool, args_masked, args_encrypted, args_hash,"
+            " reason_codes, approval_scope, created_at, expires_at, status, used) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',0)",
+            (a["id"], a["grant_id"], a.get("session_id"), a["tool"], json.dumps(a.get("args_masked") or {}),
+             a.get("args_encrypted"), a["args_hash"], json.dumps(a.get("reason_codes") or []),
+             a.get("approval_scope", "once"), a["created_at"], a["expires_at"]),
+        )
+
+    async def list_approvals(self, status: str | None = None, limit: int = 100) -> list[dict]:
+        cols = ("id, grant_id, session_id, tool, args_masked, args_hash, reason_codes, approval_scope,"
+                " created_at, expires_at, status, decided_by, decided_at, used")
+        if status:
+            return await self._all(f"SELECT {cols} FROM approvals WHERE status=? ORDER BY created_at LIMIT ?", (status, limit))
+        return await self._all(f"SELECT {cols} FROM approvals ORDER BY created_at DESC LIMIT ?", (limit,))
+
+    async def decide_approval(self, approval_id: str, decision: str, scope: str, by: str, now_iso: str) -> str:
+        """Atomic pending -> approved/denied. Returns 'ok', 'not_found', 'conflict' (already decided)
+        or 'expired'. Pending arguments are deleted once decided (F16)."""
+        async with self._lock:
+            cur = await self._db.execute("SELECT status, expires_at FROM approvals WHERE id=?", (approval_id,))
+            row = await cur.fetchone()
+            if row is None:
+                return "not_found"
+            if row["status"] != "pending":
+                return "conflict"
+            if row["expires_at"] <= now_iso:
+                await self._db.execute("UPDATE approvals SET status='expired', args_encrypted=NULL WHERE id=?", (approval_id,))
+                await self._db.commit()
+                return "expired"
+            status = "approved" if decision == "approve" else "denied"
+            await self._db.execute(
+                "UPDATE approvals SET status=?, approval_scope=?, decided_by=?, decided_at=?, args_encrypted=NULL"
+                " WHERE id=? AND status='pending'", (status, scope, by, now_iso, approval_id))
+            await self._db.commit()
+            return "ok"
     # ---------------- sessions and state ----------------
     async def admit_session(self, session_id: str, grant_id: str, max_sessions: int, since_iso: str, now_iso: str) -> bool:
         """Known session: refresh. New session: admit only if fewer than max_sessions are active.
@@ -190,7 +234,8 @@ class Store:
 
     async def update_state(self, grant_id: str, now_iso: str, add_labels: set | None = None,
                            suspicious: bool | None = None, suspended: bool | None = None,
-                           incr_calls: int = 0, denied_streak: int | None = None) -> None:
+                           incr_calls: int = 0, denied_streak: int | None = None, denied_delta: int = 0,
+                           denied_reset: bool = False) -> dict:
         """Atomic read-merge-write under the lock. Labels are only ever added (never cleared) and
         counters are incremented in place, so concurrent calls cannot erase each other's updates."""
         async with self._lock:
@@ -200,7 +245,9 @@ class Store:
             labels |= set(add_labels or ())
             vals = {
                 "call_count": (row["call_count"] if row else 0) + incr_calls,
-                "denied_streak": denied_streak if denied_streak is not None else (row["denied_streak"] if row else 0),
+                "denied_streak": 0 if denied_reset else (
+                    denied_streak if denied_streak is not None
+                    else (row["denied_streak"] if row else 0) + denied_delta),
                 "suspended": int(suspended) if suspended is not None else (row["suspended"] if row else 0),
                 # suspicious only ever turns on here; clearing it is an operator action (save_state)
                 "suspicious": 1 if suspicious else (row["suspicious"] if row else 0),
@@ -214,6 +261,8 @@ class Store:
                  vals["suspended"], vals["suspicious"], now_iso),
             )
             await self._db.commit()
+            return vals
+
     async def cleanup_state(self, now: datetime) -> list[str]:
         """F02: delete a grant's state 1 hour after it stops being active, or after 2 hours idle."""
         inactive_cut = iso(now - timedelta(hours=1))
@@ -237,6 +286,146 @@ class Store:
             await self._db.commit()
         return ids
 
+    async def mutate_rate_loop(self, grant_id: str, fn) -> Any:
+        """Atomic read-modify-write of the rate and loop JSON state. fn(rate, loop) -> (rate, loop, result)."""
+        async with self._lock:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO grant_state(grant_id, last_activity) VALUES(?, ?)", (grant_id, iso(utcnow())))
+            cur = await self._db.execute("SELECT rate_state, loop_state FROM grant_state WHERE grant_id=?", (grant_id,))
+            row = await cur.fetchone()
+            rate, loop, result = fn(json.loads(row["rate_state"] or "{}"), json.loads(row["loop_state"] or "{}"))
+            await self._db.execute("UPDATE grant_state SET rate_state=?, loop_state=? WHERE grant_id=?",
+                                   (json.dumps(rate), json.dumps(loop), grant_id))
+            await self._db.commit()
+            return result
+
+    # ---------------- tool pins (F04) ----------------
+    async def observe_pin(self, upstream: str, tool: str, new_hash: str, snapshot: str, reasons: list[str],
+                          now_iso: str) -> dict:
+        """Atomically compare a live tool definition with its pin. Returns the resulting state and what happened:
+        transition is 'first_sight', 'poisoned', 'changed' or None (nothing new)."""
+        async with self._lock:
+            cur = await self._db.execute("SELECT * FROM pins WHERE upstream=? AND tool=?", (upstream, tool))
+            row = await cur.fetchone()
+            out = {"upstream": upstream, "tool": tool, "old_hash": None, "new_hash": new_hash, "reasons": reasons}
+            if row is None:
+                state = "quarantined" if reasons else "pinned"
+                await self._db.execute(
+                    "INSERT INTO pins(upstream, tool, hash, state, description_snapshot, first_seen, reasons)"
+                    " VALUES(?,?,?,?,?,?,?)", (upstream, tool, new_hash, state, snapshot, now_iso, json.dumps(reasons)))
+                await self._db.commit()
+                return {**out, "state": state, "transition": "poisoned" if reasons else "first_sight"}
+            out["old_hash"] = row["hash"]
+            if row["hash"] == new_hash:
+                # unchanged since the pin; a tool already blocked stays blocked until an operator approves it
+                return {**out, "state": row["state"], "transition": None}
+            if row["state"] == "changed" and row["new_hash"] == new_hash:
+                return {**out, "state": "changed", "transition": None}  # still waiting for the operator
+            state = "quarantined" if row["state"] == "quarantined" else "changed"
+            await self._db.execute(
+                "UPDATE pins SET state=?, new_hash=?, new_snapshot=?, reasons=?, changed_at=? WHERE upstream=? AND tool=?",
+                (state, new_hash, snapshot, json.dumps(reasons), now_iso, upstream, tool))
+            await self._db.commit()
+            return {**out, "state": state, "transition": "changed"}
+
+    async def get_pin(self, tool: str) -> dict | None:
+        rows = await self._all("SELECT * FROM pins WHERE tool=?", (tool,))
+        return rows[0] if rows else None
+
+    async def list_pins(self) -> list[dict]:
+        rows = await self._all(
+            "SELECT upstream, tool, hash, state, description_snapshot, new_hash, new_snapshot, reasons, first_seen,"
+            " changed_at FROM pins ORDER BY upstream, tool")
+        return rows
+
+    async def approve_pin(self, upstream: str, tool: str, now_iso: str) -> bool:
+        """Operator action: adopt the observed definition as the new pin and unblock the tool."""
+        async with self._lock:
+            cur = await self._db.execute("SELECT * FROM pins WHERE upstream=? AND tool=?", (upstream, tool))
+            row = await cur.fetchone()
+            if row is None:
+                return False
+            await self._db.execute(
+                "UPDATE pins SET hash=COALESCE(new_hash, hash), description_snapshot=COALESCE(new_snapshot,"
+                " description_snapshot), new_hash=NULL, new_snapshot=NULL, state='approved_change', changed_at=?,"
+                " reasons='[]' WHERE upstream=? AND tool=?", (now_iso, upstream, tool))
+            await self._db.commit()
+            return True
+    # ---------------- data-flow store (F12) ----------------
+    async def add_fingerprints(self, grant_id: str, tool: str, hashes: list[int], now_iso: str, cap: int) -> None:
+        """Insert fingerprints; keep only the most recent `cap` per grant."""
+        if not hashes:
+            return
+        async with self._lock:
+            await self._db.executemany(
+                "INSERT INTO fingerprints(grant_id, source_tool, hash, created_at) VALUES(?,?,?,?)",
+                [(grant_id, tool, h, now_iso) for h in hashes])
+            cur = await self._db.execute("SELECT COUNT(*) AS n FROM fingerprints WHERE grant_id=?", (grant_id,))
+            extra = (await cur.fetchone())["n"] - cap
+            if extra > 0:
+                await self._db.execute(
+                    "DELETE FROM fingerprints WHERE rowid IN (SELECT rowid FROM fingerprints WHERE grant_id=?"
+                    " ORDER BY rowid LIMIT ?)", (grant_id, extra))
+            await self._db.commit()
+
+    async def fingerprint_count(self, grant_id: str) -> int:
+        return (await self._all("SELECT COUNT(*) AS n FROM fingerprints WHERE grant_id=?", (grant_id,)))[0]["n"]
+
+    async def match_fingerprints(self, grant_id: str, hashes: list[int]) -> dict[int, set[str]]:
+        """Which of these hashes does the grant know, and from which source tools."""
+        found: dict[int, set[str]] = {}
+        for i in range(0, len(hashes), 500):
+            chunk = hashes[i : i + 500]
+            marks = ",".join("?" * len(chunk))
+            for r in await self._all(
+                    f"SELECT hash, source_tool FROM fingerprints WHERE grant_id=? AND hash IN ({marks})",
+                    (grant_id, *chunk)):
+                found.setdefault(r["hash"], set()).add(r["source_tool"])
+        return found
+
+    async def add_exact_tokens(self, grant_id: str, tool: str, tokens: list[tuple[str, int, int]], now_iso: str) -> None:
+        """tokens: (blake2b hex of the flow-normal token, length, rolling hash). Duplicates are skipped."""
+        async with self._lock:
+            for token_hash, length, poly in tokens:
+                cur = await self._db.execute(
+                    "SELECT 1 FROM exact_tokens WHERE grant_id=? AND token_hash=? AND source_tool=?",
+                    (grant_id, token_hash, tool))
+                if await cur.fetchone() is None:
+                    await self._db.execute(
+                        "INSERT INTO exact_tokens(grant_id, source_tool, token_hash, created_at, length, poly)"
+                        " VALUES(?,?,?,?,?,?)", (grant_id, tool, token_hash, now_iso, length, poly))
+            await self._db.commit()
+
+    async def list_exact_tokens(self, grant_id: str) -> list[dict]:
+        return await self._all(
+            "SELECT source_tool, token_hash, length, poly FROM exact_tokens WHERE grant_id=?", (grant_id,))
+
+    async def get_egress_entries(self, grant_id: str) -> list[tuple[str, str]]:
+        """Recent flow-normal sink-bound text as (field key, text) entries, oldest first."""
+        rows = await self._all("SELECT text FROM egress_buffer WHERE grant_id=?", (grant_id,))
+        return [(k, t) for k, t in json.loads(rows[0]["text"])] if rows else []
+
+    async def append_egress_entries(self, grant_id: str, entries: list[tuple[str, str]], cap: int = 4096) -> None:
+        """Atomically append entries and keep only the most recent `cap` characters in total."""
+        async with self._lock:
+            cur = await self._db.execute("SELECT text FROM egress_buffer WHERE grant_id=?", (grant_id,))
+            row = await cur.fetchone()
+            merged = [(k, t) for k, t in json.loads(row["text"])] if row else []
+            merged.extend(entries)
+            total, keep = 0, []
+            for k, t in reversed(merged):
+                if total + len(t) > cap:
+                    t = t[-(cap - total):] if cap - total > 0 else ""
+                if t:
+                    keep.append((k, t))
+                    total += len(t)
+                if total >= cap:
+                    break
+            keep.reverse()
+            await self._db.execute(
+                "INSERT INTO egress_buffer(grant_id, text) VALUES(?,?) ON CONFLICT(grant_id) DO UPDATE SET text=excluded.text",
+                (grant_id, json.dumps(keep)))
+            await self._db.commit()
     # ---------------- audit (append only) ----------------
     async def insert_audit(self, row: dict[str, Any]) -> int:
         async with self._lock:
@@ -263,4 +452,5 @@ class Store:
                 params.append(val)
         sql = "SELECT * FROM audit" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?"
         return await self._all(sql, (*params, limit))
+
 

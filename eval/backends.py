@@ -107,8 +107,10 @@ class UnprotectedBackend:
 class GatewayBackend:
     """Talks to the firewall gateway over streamable HTTP with the scenario's grant token."""
 
-    def __init__(self, scn: Scenario, url: str, token: str):
+    def __init__(self, scn: Scenario, url: str, token: str, store=None, grant_id: str | None = None):
         self.scn = scn
+        self._store = store
+        self._grant_id = grant_id
         self._client = Client(StreamableHttpTransport(url, headers={"X-Task-Grant": token}), mode="legacy")
 
     async def __aenter__(self) -> Self:
@@ -131,4 +133,14 @@ class GatewayBackend:
         return CallOutcome(text, is_error=bool(res.is_error), code=m.group(1) if m else None)
 
     async def detections(self) -> set[str]:
-        return set()  # quarantine and flag signals arrive with the scanner (Phase 5)
+        """What the firewall itself reported about this grant: result scans (F14). A quarantine also counts as
+        flagged. This is the firewall's own signal, which is what a detection scenario is about."""
+        if self._store is None or self._grant_id is None:
+            return set()
+        found: set[str] = set()
+        for row in await self._store.query_audit(grant_id=self._grant_id, phase="result", limit=5000):
+            if row["verdict"] == "quarantine":
+                found |= {"quarantined", "flagged"}
+            elif row["verdict"] == "flag" and "families" in (row["detail"] or ""):
+                found.add("flagged")
+        return found

@@ -6,7 +6,8 @@ from tests.integration.conftest import client_for
 
 async def test_f37_50_concurrent_calls_forward_exactly_30(make_gateway):
     gw, logs = await make_gateway(["mail"])
-    _, token = await grants.create_grant(gw.store, {"task": "burst", "allowed_tools": ["mail_send_email"], "max_calls": 30})
+    _, token = await grants.create_grant(gw.store, {"task": "burst", "allowed_tools": ["mail_send_email"],
+                                                         "allowed_destinations": ["docs.example.com"], "max_calls": 30})
     async with client_for(gw, token) as c:
         results = await asyncio.gather(*[
             c.call_tool("mail_send_email", {"to": "a@docs.example.com", "subject": f"n{i}", "body": "x"},

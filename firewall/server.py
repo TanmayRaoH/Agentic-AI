@@ -13,12 +13,15 @@ from pathlib import Path
 
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.client.elicitation import ElicitResult
 from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 from fastmcp.server import create_proxy
+from fastmcp.server.providers.proxy import ProxyClient
 
-from firewall.config import PolicyConfig, Upstream, load_policy, load_upstreams
+from firewall.config import PolicyConfig, ToolsConfig, Upstream, load_policy, load_tools, load_upstreams
 from firewall.engine import Engine
 from firewall.middleware import FirewallMiddleware
+from firewall.registry import Registry
 from firewall.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +57,7 @@ class Gateway:
     store: Store
     transports: list = field(default_factory=list)
     tool_names: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     port: int = 0
     _server: uvicorn.Server | None = None
     _task: asyncio.Task | None = None
@@ -93,23 +97,59 @@ class Gateway:
         await self.store.close()
 
 
+def _blocking_client(transport, upstream: str, engine: Engine) -> ProxyClient:
+    """F39: the proxy would relay server-initiated sampling, elicitation and roots requests from an upstream
+    to the agent, which makes them an injection and exfiltration channel. Refuse them and record each attempt."""
+
+    async def sampling(messages, params, context):
+        await engine.audit_system(f"upstream {upstream!r} asked the client for model sampling", verdict="deny",
+                                  reason_code="UPSTREAM_REQUEST_BLOCKED")
+        raise PermissionError("Blocked by firewall. code=UPSTREAM_REQUEST_BLOCKED")
+
+    async def elicitation(message, response_type, params, context):
+        await engine.audit_system(f"upstream {upstream!r} asked the user for input", verdict="deny",
+                                  reason_code="UPSTREAM_REQUEST_BLOCKED")
+        return ElicitResult(action="decline")
+
+    return ProxyClient(transport, sampling_handler=sampling, elicitation_handler=elicitation, roots=[])
+
+
 async def build_gateway(*, db_path: str, upstreams: list[Upstream] | None = None,
                         policy: PolicyConfig | None = None, mode: str | None = None,
-                        env_extra: dict[str, str] | None = None) -> Gateway:
+                        env_extra: dict[str, str] | None = None, tools: ToolsConfig | None = None,
+                        path_base: str | Path | None = None) -> Gateway:
     policy = policy or load_policy(ROOT / "policy.yaml")
+    tools = tools or load_tools(ROOT / "tools.yaml")
     upstreams = upstreams if upstreams is not None else [
         u for u in load_upstreams(ROOT / "upstreams.yaml").upstreams if u.enabled]
+    registry = Registry(tools)
+    mode = resolve_mode(policy, mode)
     store = await Store(db_path).open()
-    engine = Engine(store, policy, resolve_mode(policy, mode), {u.name: u.timeout_s for u in upstreams})
+    engine = Engine(store, policy, mode, {u.name: u.timeout_s for u in upstreams}, registry=registry,
+                    path_base=path_base or os.environ.get("FW_PATH_BASE") or Path.cwd())
     mcp = FastMCP("agent-firewall", middleware=[FirewallMiddleware(engine)])
     transports = []
     for u in upstreams:
         t = transport_for(u, env_extra)
         transports.append(t)
-        mcp.mount(create_proxy(t), namespace=u.name)
+        mcp.mount(create_proxy(_blocking_client(t, u.name, engine)), namespace=u.name)
     gw = Gateway(mcp, engine, store, transports)
-    # Startup discovery: real, namespaced tool names (Section 11). Phase 3 validates them against tools.yaml.
-    gw.tool_names = sorted(t.name for t in await mcp.list_tools(run_middleware=False))
+    try:
+        # Startup discovery: real, namespaced tool names (Section 11), validated against tools.yaml (F05).
+        live = list(await mcp.list_tools(run_middleware=False))
+        gw.tool_names = sorted(t.name for t in live)
+        missing, gw.warnings = registry.validate_discovery(gw.tool_names)
+        if missing:
+            raise ConfigurationRefused(
+                "tools provided by upstreams but missing from tools.yaml: " + ", ".join(missing)
+                + ". Review each one and add it with reviewed: true (labels and risk decide how it is handled).")
+        engine.known_tools = set(gw.tool_names)
+        await engine.observe_tools(live)  # first sight: pin every tool (F04) and scan it for poisoning
+        if gw.warnings:
+            await engine.audit_system("startup warnings", {"warnings": gw.warnings})
+    except BaseException:
+        await gw.stop()  # do not leave upstream processes or the database open on a refused start
+        raise
     return gw
 
 
@@ -122,6 +162,8 @@ async def amain() -> None:
         print(f"refusing to start: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     await gw.start(port=port)
+    for w in gw.warnings:
+        print(f"WARNING: {w}", file=sys.stderr, flush=True)
     print(f"gateway listening on {gw.url}  mode={gw.engine.mode}  tools={gw.tool_names}", flush=True)
     try:
         await asyncio.Event().wait()

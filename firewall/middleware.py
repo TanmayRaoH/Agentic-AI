@@ -108,8 +108,12 @@ class FirewallMiddleware(Middleware):
             raise ToolError(f"Upstream failed. code=UPSTREAM_ERROR event={ev}") from None
         upstream_ms = (time.perf_counter() - t1) * 1000
 
-        out = await eng.check_result(sid, token, name, result, verdict.grant_id, upstream_ms, None)
-        return out
+        try:
+            return await eng.check_result(sid, token, name, result, verdict.grant_id, upstream_ms, None)
+        except Exception as exc:  # noqa: BLE001 - fail closed: a result that could not be checked is withheld
+            ev = await eng.audit_result(sid, verdict.grant_id, name, "deny", "FIREWALL_ERROR", upstream_ms, None,
+                                        {"error": type(exc).__name__})
+            raise ToolError(f"Blocked by firewall. code=FIREWALL_ERROR event={ev}") from None
 
     # ---------------- resources and prompts (F01: disabled by default) ----------------
     async def _surface_blocked(self, context, what: str) -> None:

@@ -36,9 +36,11 @@ async def load_state(store: Store, grant_id: str) -> GrantState:
 
 async def update_state(store: Store, grant_id: str, *, add_labels: set | None = None,
                        suspicious: bool | None = None, suspended: bool | None = None,
-                       incr_calls: int = 0, denied_streak: int | None = None) -> None:
-    """Atomic merge update (use this on the request path; labels are add-only)."""
-    await store.update_state(grant_id, iso(utcnow()), add_labels, suspicious, suspended, incr_calls, denied_streak)
+                       incr_calls: int = 0, denied_streak: int | None = None, denied_delta: int = 0,
+                       denied_reset: bool = False) -> dict:
+    """Atomic merge update (use this on the request path; labels are add-only). Returns the new values."""
+    return await store.update_state(grant_id, iso(utcnow()), add_labels, suspicious, suspended, incr_calls,
+                                    denied_streak, denied_delta, denied_reset)
 
 
 async def save_state(store: Store, state: GrantState) -> None:
