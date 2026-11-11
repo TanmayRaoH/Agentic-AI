@@ -7,5 +7,7 @@ __pycache__/
 fw.db*
 *.jsonl
 eval/results/*.json
+!eval/results/final-*.json
+!eval/results/heldout-before-freeze-*.json
 .env
 eval/runtime/

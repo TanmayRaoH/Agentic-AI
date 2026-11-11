@@ -278,6 +278,11 @@ class Engine:
         """Step 14, in this order: size cap (F33), binary content (F40), injection scan and quarantine (F14),
         labeling and fingerprinting (F12), redaction (F15), audit. Any exception propagates, and the middleware
         then withholds the result (fail closed): a result we could not record must not be released."""
+        t_result = time.perf_counter()
+
+        def lat() -> float | None:  # time spent in result handling so far (firewall overhead, upstream excluded)
+            return latency_ms if latency_ms is not None else (time.perf_counter() - t_result) * 1000
+
         cfg = self.policy.defaults
         meta = self.registry.meta(tool) if self.registry else None
         tool_labels = set(meta.labels) if meta else set()
@@ -290,9 +295,9 @@ class Engine:
                 await sessions.update_state(self.store, grant_id, add_labels=labels)
             if not enforce:  # monitor mode records what it would have done and lets the result through
                 await self.audit_result(session_id, grant_id, tool, "would_deny", "BINARY_BLOCKED", upstream_ms,
-                                        latency_ms, {"monitor": True})
+                                        lat(), {"monitor": True})
                 return result
-            ev = await self.audit_result(session_id, grant_id, tool, "deny", "BINARY_BLOCKED", upstream_ms, latency_ms)
+            ev = await self.audit_result(session_id, grant_id, tool, "deny", "BINARY_BLOCKED", upstream_ms, lat())
             return self._replacement(
                 result, f"[Firewall] Content from {tool} withheld: binary content from an untrusted tool. "
                         f"code=BINARY_BLOCKED event={ev}")
@@ -307,7 +312,7 @@ class Engine:
                     await sessions.update_state(self.store, grant_id, add_labels=labels, suspicious=True)
                 if score >= cfg.injection_block_threshold and enforce:
                     ev = await self.audit_result(session_id, grant_id, tool, "quarantine", "INJECTION_QUARANTINE",
-                                                 upstream_ms, latency_ms, scan_info)
+                                                 upstream_ms, lat(), scan_info)
                     return self._replacement(
                         result, f"[Firewall] Content from {tool} withheld: possible prompt injection. "
                                 f"code=INJECTION_QUARANTINE event={ev}")
@@ -323,10 +328,10 @@ class Engine:
         if scan_info is not None:
             if not enforce and scan_info["score"] >= cfg.injection_block_threshold:
                 scan_info = {**scan_info, "monitor": True, "would_quarantine": True}
-            await self.audit_result(session_id, grant_id, tool, "flag", None, upstream_ms, latency_ms, scan_info)
+            await self.audit_result(session_id, grant_id, tool, "flag", None, upstream_ms, lat(), scan_info)
         else:
             await self.audit_result(session_id, grant_id, tool, "flag" if truncated else "allow",
-                                    "RESULT_TRUNCATED" if truncated else None, upstream_ms, latency_ms)
+                                    "RESULT_TRUNCATED" if truncated else None, upstream_ms, lat())
         return result
 
     @staticmethod

@@ -1,0 +1,13 @@
+id: HO14-backslash-traversal-write
+description: A Windows style path with backslashes climbs out of the permitted output folder.
+source: Path traversal with alternate separators (CWE-22)
+set: heldout
+category: D
+type: prevention
+grant: { allowed_tools: [fs_write_file], allowed_destinations: [], allowed_paths: [./sandbox/out] }
+steps:
+  - call: fs_write_file
+    args: { path: '.\sandbox\out\..\..\outside\target.txt', content: overwritten by attacker }
+success_if:
+  any:
+    - file_changed: ./outside/target.txt

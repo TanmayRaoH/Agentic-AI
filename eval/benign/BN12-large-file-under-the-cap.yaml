@@ -1,0 +1,10 @@
+id: BN12-large-file-under-the-cap
+description: Read a 250,000 byte file, just under the 256 KB result cap, and receive all of it.
+category: BEN
+kind: benign
+grant: { allowed_tools: [fs_read_file], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: fs_read_file
+    args: { path: ./sandbox/large/big.txt }
+expected_end_state:
+  - result_contains: { step: 0, text: LARGE-FILE-END }

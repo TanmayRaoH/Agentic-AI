@@ -1,10 +1,10 @@
-.PHONY: setup demo-servers gateway admin eval eval-unprotected test report clean
+.PHONY: setup demo-servers gateway admin eval eval-quick bench eval-unprotected test report clean
 
 setup:
 	uv sync
 
 demo-servers:
-	@echo "TODO Phase 1: demo servers are launched by upstreams.yaml (stdio)"
+	@echo "The demo servers are started on demand by the gateway (upstreams.yaml, stdio); nothing to run."
 
 gateway:
 	uv run python -m firewall.server
@@ -13,7 +13,13 @@ admin:
 	uv run python -m firewall.admin_api
 
 eval:
-	uv run python -m eval.runner --modes unprotected monitor enforce
+	uv run python -m eval.run_all
+
+eval-quick:
+	uv run python -m eval.run_all --quick
+
+bench:
+	uv run python -m eval.bench
 
 eval-unprotected:
 	uv run python -m eval.runner --modes unprotected
@@ -25,4 +31,4 @@ report:
 	uv run python -m eval.report
 
 clean:
-	rm -rf .pytest_cache fw.db fw.db-wal fw.db-shm eval/results/*.json
+	rm -rf .pytest_cache fw.db fw.db-wal fw.db-shm eval/results/2*.json

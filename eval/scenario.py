@@ -28,6 +28,8 @@ class Scenario(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str
     description: str = ""
+    known_gap: str = ""  # why this scenario is expected to get through (filled in after measuring, never to tune)
+    source: str = ""  # published example this scenario is adapted from (held-out set)
     set: Literal["dev", "heldout"] = "dev"
     category: str
     kind: Literal["attack", "benign"] = "attack"

@@ -1,0 +1,15 @@
+id: BN13-edit-file-in-output-folder
+description: Write a file in the permitted output folder, read it back and edit it.
+category: BEN
+kind: benign
+grant: { allowed_tools: [fs_read_file, fs_write_file], allowed_destinations: [], allowed_paths: [./sandbox] }
+steps:
+  - call: fs_write_file
+    args: { path: ./sandbox/out/todo.txt, content: "1. draft" }
+  - call: fs_read_file
+    args: { path: ./sandbox/out/todo.txt }
+  - call: fs_write_file
+    args: { path: ./sandbox/out/todo.txt, content: "1. draft\n2. review" }
+expected_end_state:
+  - result_contains: { step: 1, text: "1. draft" }
+  - file_equals: { path: ./sandbox/out/todo.txt, content: "1. draft\n2. review" }

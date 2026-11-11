@@ -1,0 +1,75 @@
+{
+  "generated": "2026-11-11T10:47:43+00:00",
+  "calls_per_path": 200,
+  "warmup_calls": 20,
+  "paths": {
+    "direct": {
+      "end_to_end_ms": {
+        "n": 200,
+        "p50": 3.744,
+        "p95": 4.743,
+        "p99": 6.124
+      }
+    },
+    "monitor/scanner-on": {
+      "end_to_end_ms": {
+        "n": 200,
+        "p50": 16.886,
+        "p95": 20.797,
+        "p99": 41.083
+      },
+      "firewall_overhead_ms": {
+        "n": 200,
+        "p50": 5.367,
+        "p95": 7.443,
+        "p99": 15.949
+      },
+      "added_end_to_end_p50_ms": 13.142
+    },
+    "monitor/scanner-off": {
+      "end_to_end_ms": {
+        "n": 200,
+        "p50": 16.742,
+        "p95": 23.266,
+        "p99": 41.233
+      },
+      "firewall_overhead_ms": {
+        "n": 200,
+        "p50": 5.207,
+        "p95": 7.239,
+        "p99": 19.122
+      },
+      "added_end_to_end_p50_ms": 12.998
+    },
+    "enforce/scanner-on": {
+      "end_to_end_ms": {
+        "n": 200,
+        "p50": 17.184,
+        "p95": 20.095,
+        "p99": 40.794
+      },
+      "firewall_overhead_ms": {
+        "n": 200,
+        "p50": 5.328,
+        "p95": 7.14,
+        "p99": 18.087
+      },
+      "added_end_to_end_p50_ms": 13.44
+    },
+    "enforce/scanner-off": {
+      "end_to_end_ms": {
+        "n": 200,
+        "p50": 16.896,
+        "p95": 26.453,
+        "p99": 38.081
+      },
+      "firewall_overhead_ms": {
+        "n": 200,
+        "p50": 5.235,
+        "p95": 9.004,
+        "p99": 13.514
+      },
+      "added_end_to_end_p50_ms": 13.152
+    }
+  }
+}

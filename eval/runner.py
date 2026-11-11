@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import platform
 import shutil
+import subprocess
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -22,6 +24,21 @@ from eval.ground_truth import FIXTURE_WORLD, WORLD, eval_cond
 from eval.scenario import EVAL_DIR, Scenario, default_dirs, load_scenarios
 
 console = Console()
+
+
+def environment_info() -> dict:
+    """Facts the report prints so a number can be tied to a code version (F30)."""
+    from importlib.metadata import version
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=False,
+                                cwd=EVAL_DIR.parent).stdout.strip() or "unknown"
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=False,
+                                    cwd=EVAL_DIR.parent).stdout.strip())
+    except OSError:
+        commit, dirty = "unknown", False
+    return {"fastmcp": version("fastmcp"), "python": platform.python_version(), "platform": platform.system(),
+            "git_commit": commit + ("+uncommitted changes" if dirty else ""),
+            "date": datetime.now(UTC).isoformat(timespec="seconds")}
 
 
 def reset_environment() -> None:
@@ -167,11 +184,13 @@ async def main_async(args) -> int:
                 await manager.stop()
         summary = summarize(results)
         print_report(mode, results, summary)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        out = EVAL_DIR / "results" / f"{stamp}-{mode}.json"
-        out.write_text(json.dumps({"mode": mode, "summary": summary, "results": results}, indent=2), encoding="utf-8")
+        stamp = args.tag or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        out = EVAL_DIR / "results" / (f"{stamp}-{mode}.json")
+        meta = {**environment_info(), "reps": args.reps, "sets": args.sets, "only": args.only}
+        out.write_text(json.dumps({"mode": mode, "meta": meta, "summary": summary, "results": results}, indent=2),
+                       encoding="utf-8")
         console.print(f"wrote {out}")
-        if mode == "unprotected" and not args.only:
+        if mode == "unprotected" and not args.only and args.sets == ["dev"]:
             write_before_table(summary, results)
     return 0
 
@@ -182,6 +201,7 @@ def main() -> int:
     ap.add_argument("--sets", nargs="+", default=["dev"], choices=["dev", "heldout"])
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--only", nargs="*", default=[])
+    ap.add_argument("--tag", default="", help="write eval/results/<tag>-<mode>.json instead of a timestamped name")
     return asyncio.run(main_async(ap.parse_args()))
 
 

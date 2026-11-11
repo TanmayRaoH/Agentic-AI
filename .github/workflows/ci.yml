@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: uv sync
+      - name: Lint
+        run: uv run ruff check .
+      - name: No innerHTML in dashboard code
+        run: "! grep -rn 'innerHTML' firewall/dashboard"
+      - name: Tests (includes the attack regression suite)
+        run: uv run pytest -q
+      - name: Shortened evaluation
+        run: uv run python -m eval.run_all --quick
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            eval/report.md
+            eval/results/final-*.json
