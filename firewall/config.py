@@ -53,6 +53,7 @@ class Defaults(_Strict):
     trifecta_mode: Literal["approve", "block", "off"] = "approve"
     approval_mode: Literal["block", "defer"] = "block"
     approval_timeout_s: int = 60
+    approval_pending_ttl_s: int = 900  # deferred mode: how long a pending approval waits for the operator
     injection_block_threshold: float = 0.8
     injection_flag_threshold: float = 0.4
     scan_all: bool = False

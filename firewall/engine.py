@@ -1,16 +1,15 @@
-"""Request pipeline (Section 4). Implemented: steps 1 to 3 and 5 to 12 (11 is a stand-in), plus the
-size cap, labeling and fingerprinting of step 14, and the audit.
-
-Step 4 (pins), the injection scan of step 14 and the approval queue of step 11 arrive in Phases 5 and 6;
-each is added at the marked place so the order stays exactly as in the guide.
+"""Request pipeline (Section 4): steps 1 to 14 plus the audit. Hard denies end the pipeline at their step; the
+approval queue (step 11) is only reached by calls that need nothing but an approval.
 """
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from firewall import (
+    approvals,
     audit,
     content,
     destinations,
@@ -29,19 +28,20 @@ from firewall import (
 from firewall.config import PolicyConfig
 from firewall.models import Verdict
 from firewall.registry import Registry
-from firewall.store import Store
+from firewall.store import Store, iso, utcnow
 
 STATUS_CODES = {"expired": "GRANT_EXPIRED", "revoked": "GRANT_REVOKED", "exhausted": "GRANT_EXHAUSTED"}
 CLEANUP_EVERY_S = 60.0
 # denies that say nothing about the agent misbehaving on a valid grant do not count toward suspension
 NOT_COUNTED = {"NO_GRANT", "GRANT_EXPIRED", "GRANT_REVOKED", "GRANT_EXHAUSTED", "TOO_MANY_SESSIONS",
-               "GRANT_SUSPENDED", "FIREWALL_ERROR"}
+               "GRANT_SUSPENDED", "FIREWALL_ERROR", "APPROVAL_PENDING", "APPROVAL_DENIED", "APPROVAL_TIMEOUT"}
 
 
 class Engine:
     def __init__(self, store: Store, policy: PolicyConfig, mode: str | None = None,
                  upstream_timeouts: dict[str, float] | None = None, registry: Registry | None = None,
-                 known_tools: set[str] | None = None, path_base: Path | None = None):
+                 known_tools: set[str] | None = None, path_base: Path | None = None,
+                 approval_crypto: approvals.ApprovalCrypto | None = None):
         self.store = store
         self.policy = policy
         self.mode = mode or policy.defaults.mode
@@ -51,6 +51,9 @@ class Engine:
         self.known_tools = known_tools
         # directory the upstream tools treat as their working directory; relative paths resolve against it
         self.path_base = Path(path_base) if path_base is not None else Path.cwd()
+        # None means the approval queue is not configured (no FW_APPROVAL_KEY): a call that needs approval is
+        # then held back with the code of its reason, which is still fail closed
+        self.approval_crypto = approval_crypto
         self._warned: set[str] = set()
         self._last_cleanup = 0.0
 
@@ -67,6 +70,9 @@ class Engine:
 
     def agent_message(self, v: Verdict) -> str:
         """Generic text only: reason code and event id, no matched rule or pattern (no oracle)."""
+        if v.code == "APPROVAL_PENDING":  # deferred mode: tell the agent which approval to wait for
+            return (f"Approval required. code=APPROVAL_PENDING approval={v.detail.get('approval_id')} "
+                    f"event={v.event_id}. Retry the identical call after it has been approved.")
         return f"Blocked by firewall. code={v.code} event={v.event_id}"
 
     def _audit_verdict(self, v: Verdict) -> str:
@@ -151,9 +157,10 @@ class Engine:
                     v.grant_id = grant.id
                     return v
             if pii:
-                # PII in a sink call needs approval unless the destination is in the grant. Reaching this point
-                # means the destination check passed, i.e. it is in the grant, so no approval is added.
+                # PII in a sink call always needs an operator's approval (PII_IN_ARGS), even to a destination that
+                # is in the grant; a destination outside the grant was already denied above.
                 info["pii"] = [{"kind": m.kind, "masked": m.masked, "path": m.path} for m in pii]
+                approval_reasons.append("PII_IN_ARGS")
             # Step 9: flow check (F12) and trifecta rule (F13), sink calls only
             state = await sessions.load_state(self.store, grant.id)  # fresh: labels may have changed since step 2
             if is_sink:
@@ -161,6 +168,7 @@ class Engine:
                 if eg.verdict is not None:
                     eg.verdict.grant_id = grant.id
                     return eg.verdict
+                info["private_matches"] = eg.fp_overlap
                 if eg.declassified:
                     info["declassified"] = eg.declassified  # allow_flows used; recorded in the audit row
                 if cfg.trifecta_mode != "off" and ({"private", "untrusted"} <= state.labels or state.suspicious):
@@ -180,17 +188,90 @@ class Engine:
         # An operator can also demand approval for specific tools on a grant (GRANT_APPROVAL)
         if tool in grant.approval_required_for:
             approval_reasons.append("GRANT_APPROVAL")
-        # Step 11: approval. The queue and wait flow arrive in Phase 6; until then a call that needs
-        # approval is simply held back (fail closed in enforce mode).
-        if approval_reasons:
-            return Verdict("require_approval", list(dict.fromkeys(approval_reasons)), rule_id=rule_id,
-                           grant_id=grant.id, detail=info)
+        # Step 11: approval. Reached only by calls that need nothing but an approval; hard denies never get here.
+        reasons = list(dict.fromkeys(approval_reasons))
+        if reasons:
+            if self.mode != "enforce":
+                # monitor mode records "would require approval" and forwards, so the call still spends budget
+                if not await grants.reserve_budget(self.store, grant.id):
+                    return self.deny("GRANT_EXHAUSTED", grant_id=grant.id)
+                await sessions.update_state(self.store, grant.id, incr_calls=1, denied_reset=True)
+                return Verdict("require_approval", reasons, rule_id=rule_id, grant_id=grant.id, detail=info)
+            if self.approval_crypto is None:
+                return Verdict("require_approval", reasons, rule_id=rule_id, grant_id=grant.id, detail=info)
+            outcome = await self._approval_stage(grant, session_id, tool, args, reasons, meta, info, rule_id)
+            if outcome is not None:
+                return outcome
         # Step 12: reserve one unit of budget atomically (F06)
         if not await grants.reserve_budget(self.store, grant.id):
             return self.deny("GRANT_EXHAUSTED", grant_id=grant.id)
         await sessions.update_state(self.store, grant.id, incr_calls=1, denied_reset=True)
         return Verdict("allow", grant_id=grant.id, detail=info)
 
+    async def _approval_stage(self, grant, session_id: str, tool: str, args: dict, reasons: list[str], meta,
+                              info: dict, rule_id: str | None) -> Verdict | None:
+        """Step 11 (F16). Returns None when the call may proceed (an approval was found and used), otherwise a
+        deny verdict: APPROVAL_PENDING (deferred mode), APPROVAL_DENIED or APPROVAL_TIMEOUT."""
+        cfg = self.policy.defaults
+        crypto = self.approval_crypto
+        args_hash = audit.args_hash(args)
+        now = utcnow()
+        destination = self._single_destination(meta, args)
+
+        def outcome(code: str, approval_id: str | None = None, message: str = "") -> Verdict:
+            detail = {**info, "approval_reasons": reasons}
+            if approval_id:
+                detail["approval_id"] = approval_id
+            if message:
+                detail["message"] = message
+            return Verdict("deny", [code, *reasons], rule_id=rule_id, grant_id=grant.id, detail=detail)
+
+        # 1. scope "destination": the same tool and destination were approved for the rest of this grant
+        if destination:
+            row = await self.store.find_destination_approval(grant.id, tool, destination)
+            if row is not None:
+                info["approval_id"] = row["id"]
+                info["approval_scope"] = "destination"
+                return None
+        # 2. an approval for exactly this call (single use, within 120 seconds of the decision)
+        since = iso(now - timedelta(seconds=approvals.MAX_AGE_S))
+        row = await self.store.find_decided_approval(grant.id, tool, args_hash, "approved", since)
+        if row is not None and await approvals.consume(self.store, row["id"], tool, args_hash):
+            info["approval_id"] = row["id"]
+            return None
+        # 3. a denial the retrying agent has not been told about yet
+        denied = await self.store.find_decided_approval(
+            grant.id, tool, args_hash, "denied", iso(now - timedelta(seconds=approvals.DENIAL_AGE_S)))
+        if denied is not None and await approvals.consume(self.store, denied["id"], tool, args_hash, "denied"):
+            return outcome("APPROVAL_DENIED", denied["id"])
+        # 4. nothing usable: ask the operator. An identical pending request is reused, never duplicated.
+        deferred = cfg.approval_mode == "defer"
+        ttl = cfg.approval_pending_ttl_s if deferred else cfg.approval_timeout_s
+        approval_id = await approvals.request(
+            self.store, crypto, grant.id, session_id, tool, args, reasons, ttl_s=ttl, destination=destination,
+            detail={"private_matches": info.get("private_matches", 0), "rule_id": rule_id})
+        if deferred:
+            return outcome("APPROVAL_PENDING", approval_id)
+        status = await approvals.wait(self.store, approval_id, cfg.approval_timeout_s)
+        if status == "expired":
+            return outcome("APPROVAL_TIMEOUT", approval_id)
+        if status == "denied":
+            await approvals.consume(self.store, approval_id, tool, args_hash, "denied")
+            return outcome("APPROVAL_DENIED", approval_id)
+        if await approvals.consume(self.store, approval_id, tool, args_hash):
+            info["approval_id"] = approval_id
+            return None
+        return outcome("APPROVAL_DENIED", approval_id, "the approval was already used by an identical call")
+
+    def _single_destination(self, meta, args: dict) -> str | None:
+        """The one destination host of a sink call, or None (not a sink, several recipients, or unclear)."""
+        if meta is None or "sink" not in meta.labels:
+            return None
+        try:
+            hosts = set(destinations.destinations_of(meta, args))
+        except destinations.DestinationError:
+            return None
+        return next(iter(hosts)) if len(hosts) == 1 else None
     async def check_result(self, session_id: str, token: str | None, tool: str, result: Any,
                            grant_id: str | None = None, upstream_ms: float | None = None,
                            latency_ms: float | None = None) -> Any:
@@ -342,3 +423,4 @@ class Engine:
         if now - self._last_cleanup >= CLEANUP_EVERY_S:
             self._last_cleanup = now
             await sessions.cleanup(self.store)
+            await self.store.sweep_expired_approvals(iso(utcnow()))  # pending rows lose their stored arguments

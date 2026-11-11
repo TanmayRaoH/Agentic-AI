@@ -86,7 +86,9 @@ async def test_f34_failures_older_than_a_minute_do_not_count(api):
 async def test_f17_health_reports_mode_and_config_version(api):
     c, _, _ = api
     body = (await c.get("/health", headers=H)).json()
-    assert body == {"status": "ok", "mode": "enforce", "monitor_banner": False, "config_version": "abc123"}
+    assert body["status"] == "ok" and body["mode"] == "enforce" and body["monitor_banner"] is False
+    assert body["config_version"] == "abc123"
+    assert body["approvals_enabled"] is False and body["selftest"] is None  # nothing has registered a gateway yet
 
 
 async def test_f06_create_list_get_revoke_flow_and_token_shown_once(api):
@@ -167,7 +169,7 @@ async def test_f08_resume_clears_suspension(api):
 
 async def _approval(store, aid="ap_1", gid="g_1", expires="2099-01-01T00:00:00+00:00"):
     await store.insert_approval({"id": aid, "grant_id": gid, "tool": "mail_send_email", "args_hash": "h",
-                                 "args_encrypted": b"secret-bytes", "reason_codes": ["TRIFECTA_APPROVAL"],
+                                 "args_encrypted": b"secret-bytes", "reason_codes": ["TRIFECTA_APPROVAL"], "destination": "docs.example.com",
                                  "created_at": iso(utcnow()), "expires_at": expires})
 
 

@@ -13,6 +13,8 @@ from typing import Any
 
 import aiosqlite
 
+from firewall import chain
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS grants(
   id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, token_prefix TEXT, task TEXT,
@@ -43,7 +45,9 @@ CREATE TABLE IF NOT EXISTS approvals(
   id TEXT PRIMARY KEY, grant_id TEXT, session_id TEXT, tool TEXT, args_masked TEXT,
   args_encrypted BLOB, args_hash TEXT, reason_codes TEXT, approval_scope TEXT,
   created_at TEXT, expires_at TEXT, status TEXT, decided_by TEXT, decided_at TEXT,
-  used INTEGER DEFAULT 0);
+  used INTEGER DEFAULT 0, destination TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS idx_approvals_lookup ON approvals(grant_id, tool, args_hash);
+CREATE TABLE IF NOT EXISTS runtime_info(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
 CREATE TABLE IF NOT EXISTS audit(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, session_id TEXT, grant_id TEXT, tool TEXT,
   args_masked TEXT, args_hash TEXT, phase TEXT, verdict TEXT, reason_code TEXT, rule_id TEXT,
@@ -54,6 +58,8 @@ CREATE TABLE IF NOT EXISTS eval_runs(
   results TEXT);
 """
 
+APPROVAL_COLUMNS = ("id, grant_id, session_id, tool, args_masked, args_hash, reason_codes, approval_scope, created_at,"
+                    " expires_at, status, decided_by, decided_at, used, destination, detail")
 GRANT_COLUMNS = (
     "id, token_prefix, task, allowed_tools, allowed_destinations, allowed_paths, max_calls, "
     "used_calls, max_sessions, created_at, expires_at, created_by, approval_required_for, status"
@@ -148,28 +154,101 @@ class Store:
         """Test and harness helper (e.g. to build an already expired grant)."""
         await self._run("UPDATE grants SET expires_at=? WHERE id=?", (expires_at, grant_id))
 
-    # ---------------- approvals (queue rows; the wait/encrypt flow arrives in Phase 6) ----------------
+    # ---------------- approvals (F16) ----------------
     async def insert_approval(self, a: dict) -> None:
         await self._run(
             "INSERT INTO approvals(id, grant_id, session_id, tool, args_masked, args_encrypted, args_hash,"
-            " reason_codes, approval_scope, created_at, expires_at, status, used) VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',0)",
+            " reason_codes, approval_scope, created_at, expires_at, status, used, destination, detail)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,?)",
             (a["id"], a["grant_id"], a.get("session_id"), a["tool"], json.dumps(a.get("args_masked") or {}),
              a.get("args_encrypted"), a["args_hash"], json.dumps(a.get("reason_codes") or []),
-             a.get("approval_scope", "once"), a["created_at"], a["expires_at"]),
+             a.get("approval_scope", "once"), a["created_at"], a["expires_at"], a.get("destination"),
+             json.dumps(a.get("detail") or {})),
         )
 
-    async def list_approvals(self, status: str | None = None, limit: int = 100) -> list[dict]:
-        cols = ("id, grant_id, session_id, tool, args_masked, args_hash, reason_codes, approval_scope,"
-                " created_at, expires_at, status, decided_by, decided_at, used")
+    async def insert_approval_unique(self, a: dict, now_iso: str) -> tuple[str, bool]:
+        """Create a pending approval unless an identical request (same grant, tool and canonical arguments) is already
+        pending; in that case return the existing id. The check and the insert are one step under the lock, so two
+        identical calls arriving together can never create two rows. Returns (id, created)."""
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT id FROM approvals WHERE grant_id=? AND tool=? AND args_hash=? AND status='pending' AND expires_at > ?"
+                " ORDER BY created_at DESC LIMIT 1", (a["grant_id"], a["tool"], a["args_hash"], now_iso))
+            row = await cur.fetchone()
+            if row is not None:
+                return row["id"], False
+            await self._db.execute(
+                "INSERT INTO approvals(id, grant_id, session_id, tool, args_masked, args_encrypted, args_hash,"
+                " reason_codes, approval_scope, created_at, expires_at, status, used, destination, detail)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,?)",
+                (a["id"], a["grant_id"], a.get("session_id"), a["tool"], json.dumps(a.get("args_masked") or {}),
+                 a.get("args_encrypted"), a["args_hash"], json.dumps(a.get("reason_codes") or []),
+                 a.get("approval_scope", "once"), a["created_at"], a["expires_at"], a.get("destination"),
+                 json.dumps(a.get("detail") or {})))
+            await self._db.commit()
+            return a["id"], True
+
+    async def get_approval(self, approval_id: str, with_args: bool = False) -> dict | None:
+        cols = "*" if with_args else APPROVAL_COLUMNS
+        rows = await self._all(f"SELECT {cols} FROM approvals WHERE id=?", (approval_id,))
+        return rows[0] if rows else None
+
+    async def list_approvals(self, status: str | None = None, limit: int = 100, with_args: bool = False) -> list[dict]:
+        cols = "*" if with_args else APPROVAL_COLUMNS
         if status:
             return await self._all(f"SELECT {cols} FROM approvals WHERE status=? ORDER BY created_at LIMIT ?", (status, limit))
         return await self._all(f"SELECT {cols} FROM approvals ORDER BY created_at DESC LIMIT ?", (limit,))
 
+    async def find_pending_approval(self, grant_id: str, tool: str, args_hash: str, now_iso: str) -> dict | None:
+        """An identical request (same grant, tool and canonical arguments) that is still waiting for a decision."""
+        rows = await self._all(
+            f"SELECT {APPROVAL_COLUMNS} FROM approvals WHERE grant_id=? AND tool=? AND args_hash=? AND status='pending'"
+            " AND expires_at > ? ORDER BY created_at DESC LIMIT 1", (grant_id, tool, args_hash, now_iso))
+        return rows[0] if rows else None
+
+    async def find_decided_approval(self, grant_id: str, tool: str, args_hash: str, status: str,
+                                    since_iso: str) -> dict | None:
+        """The newest unused approved/denied row for this exact call decided since `since_iso`."""
+        rows = await self._all(
+            f"SELECT {APPROVAL_COLUMNS} FROM approvals WHERE grant_id=? AND tool=? AND args_hash=? AND status=?"
+            " AND used=0 AND decided_at >= ? ORDER BY decided_at DESC LIMIT 1",
+            (grant_id, tool, args_hash, status, since_iso))
+        return rows[0] if rows else None
+
+    async def find_destination_approval(self, grant_id: str, tool: str, destination: str) -> dict | None:
+        """An approval with scope 'destination' for the same tool and destination, valid for the rest of the grant."""
+        rows = await self._all(
+            f"SELECT {APPROVAL_COLUMNS} FROM approvals WHERE grant_id=? AND tool=? AND destination=? AND status='approved'"
+            " AND approval_scope='destination' ORDER BY decided_at DESC LIMIT 1", (grant_id, tool, destination))
+        return rows[0] if rows else None
+
+    async def consume_approval(self, approval_id: str, tool: str, args_hash: str, since_iso: str,
+                               status: str = "approved") -> bool:
+        """Single use: flips `used` from 0 to 1 in one statement, only for a matching, recent decision."""
+        n = await self._run(
+            "UPDATE approvals SET used=1 WHERE id=? AND tool=? AND args_hash=? AND status=? AND used=0"
+            " AND decided_at >= ?", (approval_id, tool, args_hash, status, since_iso))
+        return n == 1
+
+    async def expire_if_pending(self, approval_id: str) -> bool:
+        """The waiter gave up: pending -> expired and the stored arguments are deleted. False if it was decided."""
+        n = await self._run(
+            "UPDATE approvals SET status='expired', args_encrypted=NULL WHERE id=? AND status='pending'", (approval_id,))
+        return n == 1
+
+    async def sweep_expired_approvals(self, now_iso: str) -> int:
+        """Pending rows past their expiry become expired and lose their stored arguments (F16)."""
+        return await self._run(
+            "UPDATE approvals SET status='expired', args_encrypted=NULL WHERE status='pending' AND expires_at <= ?",
+            (now_iso,))
+
     async def decide_approval(self, approval_id: str, decision: str, scope: str, by: str, now_iso: str) -> str:
-        """Atomic pending -> approved/denied. Returns 'ok', 'not_found', 'conflict' (already decided)
-        or 'expired'. Pending arguments are deleted once decided (F16)."""
+        """Atomic pending -> approved/denied. Returns 'ok', 'not_found', 'conflict' (already decided),
+        'expired' or 'no_destination' (scope destination on a call without a destination).
+        Pending arguments are deleted once decided (F16)."""
         async with self._lock:
-            cur = await self._db.execute("SELECT status, expires_at FROM approvals WHERE id=?", (approval_id,))
+            cur = await self._db.execute(
+                "SELECT status, expires_at, destination FROM approvals WHERE id=?", (approval_id,))
             row = await cur.fetchone()
             if row is None:
                 return "not_found"
@@ -179,12 +258,24 @@ class Store:
                 await self._db.execute("UPDATE approvals SET status='expired', args_encrypted=NULL WHERE id=?", (approval_id,))
                 await self._db.commit()
                 return "expired"
+            if decision == "approve" and scope == "destination" and not row["destination"]:
+                return "no_destination"
             status = "approved" if decision == "approve" else "denied"
             await self._db.execute(
                 "UPDATE approvals SET status=?, approval_scope=?, decided_by=?, decided_at=?, args_encrypted=NULL"
                 " WHERE id=? AND status='pending'", (status, scope, by, now_iso, approval_id))
             await self._db.commit()
             return "ok"
+
+    # ---------------- runtime info (written by the gateway, read by the admin API) ----------------
+    async def set_runtime(self, key: str, value: Any, now_iso: str) -> None:
+        await self._run(
+            "INSERT INTO runtime_info(key, value, updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET"
+            " value=excluded.value, updated_at=excluded.updated_at", (key, json.dumps(value), now_iso))
+
+    async def get_runtime(self, key: str) -> Any:
+        rows = await self._all("SELECT value FROM runtime_info WHERE key=?", (key,))
+        return json.loads(rows[0]["value"]) if rows else None
     # ---------------- sessions and state ----------------
     async def admit_session(self, session_id: str, grant_id: str, max_sessions: int, since_iso: str, now_iso: str) -> bool:
         """Known session: refresh. New session: admit only if fewer than max_sessions are active.
@@ -428,21 +519,49 @@ class Store:
             await self._db.commit()
     # ---------------- audit (append only) ----------------
     async def insert_audit(self, row: dict[str, Any]) -> int:
+        """Append one row and chain it to the previous one. BEGIN IMMEDIATE takes SQLite's write lock before the
+        previous hash is read, so the gateway and the admin API (two processes) can never fork the chain."""
+        values = {
+            "ts": row.get("ts") or iso(utcnow()), "session_id": row.get("session_id"), "grant_id": row.get("grant_id"),
+            "tool": row.get("tool"),
+            "args_masked": json.dumps(row.get("args_masked")) if row.get("args_masked") is not None else None,
+            "args_hash": row.get("args_hash"), "phase": row.get("phase"), "verdict": row.get("verdict"),
+            "reason_code": row.get("reason_code"), "rule_id": row.get("rule_id"),
+            "detail": json.dumps(row.get("detail") or {}), "latency_ms": row.get("latency_ms"),
+            "upstream_ms": row.get("upstream_ms"), "mode": row.get("mode"),
+        }
         async with self._lock:
-            cur = await self._db.execute(
-                "INSERT INTO audit(ts, session_id, grant_id, tool, args_masked, args_hash, phase, verdict,"
-                " reason_code, rule_id, detail, latency_ms, upstream_ms, mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    row.get("ts") or iso(utcnow()), row.get("session_id"), row.get("grant_id"), row.get("tool"),
-                    json.dumps(row.get("args_masked")) if row.get("args_masked") is not None else None,
-                    row.get("args_hash"), row.get("phase"), row.get("verdict"), row.get("reason_code"),
-                    row.get("rule_id"), json.dumps(row.get("detail") or {}), row.get("latency_ms"),
-                    row.get("upstream_ms"), row.get("mode"),
-                ),
-            )
-            await self._db.commit()
-            return cur.lastrowid
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await self._db.execute("SELECT row_hash FROM audit ORDER BY id DESC LIMIT 1")
+                last = await cur.fetchone()
+                prev = last["row_hash"] if last and last["row_hash"] else chain.GENESIS
+                cur = await self._db.execute(
+                    "INSERT INTO audit(ts, session_id, grant_id, tool, args_masked, args_hash, phase, verdict,"
+                    " reason_code, rule_id, detail, latency_ms, upstream_ms, mode, prev_hash)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (*values.values(), prev))
+                row_id = cur.lastrowid
+                digest = chain.compute_hash({"id": row_id, **values}, prev)
+                await self._db.execute("UPDATE audit SET row_hash=? WHERE id=?", (digest, row_id))
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+            return row_id
 
+    async def audit_after(self, last_id: int, limit: int = 2000) -> list[dict]:
+        return await self._all("SELECT * FROM audit WHERE id > ? ORDER BY id LIMIT ?", (last_id, limit))
+
+    async def audit_head(self) -> dict | None:
+        rows = await self._all("SELECT id, row_hash FROM audit ORDER BY id DESC LIMIT 1")
+        if not rows:
+            return None
+        count = (await self._all("SELECT COUNT(*) AS n FROM audit"))[0]["n"]
+        return {**rows[0], "rows": count}
+
+    async def audit_row(self, row_id: int) -> dict | None:
+        rows = await self._all("SELECT * FROM audit WHERE id=?", (row_id,))
+        return rows[0] if rows else None
     async def query_audit(self, grant_id: str | None = None, verdict: str | None = None,
                           phase: str | None = None, limit: int = 100) -> list[dict]:
         where, params = [], []

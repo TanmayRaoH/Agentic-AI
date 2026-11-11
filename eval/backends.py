@@ -107,18 +107,26 @@ class UnprotectedBackend:
 class GatewayBackend:
     """Talks to the firewall gateway over streamable HTTP with the scenario's grant token."""
 
-    def __init__(self, scn: Scenario, url: str, token: str, store=None, grant_id: str | None = None):
+    def __init__(self, scn: Scenario, url: str, token: str, store=None, grant_id: str | None = None,
+                 approver=None):
         self.scn = scn
+        self._approver = approver  # plays the operator for auto_approve scenarios
         self._store = store
         self._grant_id = grant_id
         self._client = Client(StreamableHttpTransport(url, headers={"X-Task-Grant": token}), mode="legacy")
 
     async def __aenter__(self) -> Self:
+        if self._approver is not None:
+            await self._approver.start()
         await self._client.__aenter__()
         return self
 
     async def __aexit__(self, *exc) -> None:
-        await self._client.__aexit__(*exc)
+        try:
+            await self._client.__aexit__(*exc)
+        finally:
+            if self._approver is not None:
+                await self._approver.stop()
 
     async def visible_tools(self) -> set[str]:
         return {t.name for t in await self._client.list_tools()}

@@ -216,6 +216,7 @@ class EgressResult:
     declassified: list[str] = field(default_factory=list)
     # (field key, flow-normal text) entries to remember once the call is allowed
     buffer_entries: list[tuple[str, str]] = field(default_factory=list)
+    fp_overlap: int = 0  # distinct private fingerprints found in this call (shown to the operator, F16)
 
 
 def _covered(sources: set[str], tool: str, allow_flows: list[AllowFlow]) -> bool:
@@ -282,6 +283,7 @@ async def evaluate_egress(store: Store, grant_id: str, tool: str, args: dict,
                     await scan(e2[-tail_len:] + head, False)
                     await scan(n[-tail_len:] + e2[:tail_len], False)
     fp_sources = set().union(*fp_hits.values()) if len(fp_hits) >= FP_THRESHOLD else set()
+    result.fp_overlap = len(fp_hits)
     sources = token_sources | fp_sources
     if not sources:
         return result

@@ -166,14 +166,25 @@ async def test_f09_secret_in_non_sink_args_is_denied_unless_the_tool_is_allowed(
         "SECRET_IN_ARGS"]
 
 
-async def test_f09_pii_to_an_allowed_destination_is_recorded_for_the_operator_but_not_blocked(env):
+async def test_f09_pii_in_a_sink_call_needs_approval_even_to_an_allowed_destination(env):
     store, make, grant = env
     eng = make()
     g, tok = await grant()
     v = await eng.check_call("s", tok, "mail_send_email", {**MAIL, "body": "Call Jane at +1 415 555 0134"})
-    assert v.action == "allow" and [p["kind"] for p in v.detail["pii"]] == ["phone"]  # the recipient is not counted
+    assert v.action == "require_approval" and "PII_IN_ARGS" in v.reason_codes
+    assert [p["kind"] for p in v.detail["pii"]] == ["phone"]  # the recipient is not counted
     assert "415" not in str(v.detail["pii"])
 
+
+async def test_f09_pii_never_overrides_a_hard_deny_and_plain_text_needs_no_pii_approval(env):
+    store, make, grant = env
+    eng = make()
+    g, tok = await grant()
+    outside = await eng.check_call("s", tok, "mail_send_email",
+                                   {**MAIL, "to": "x@attacker.example", "body": "Call Jane at +1 415 555 0134"})
+    assert outside.action == "deny" and outside.reason_codes == ["DEST_NOT_ALLOWED"]
+    plain = await eng.check_call("s", tok, "mail_send_email", MAIL)
+    assert plain.action == "allow" and "PII_IN_ARGS" not in plain.reason_codes
 
 async def test_f10_path_and_destination_checks_run_in_the_pipeline(env):
     store, make, grant = env

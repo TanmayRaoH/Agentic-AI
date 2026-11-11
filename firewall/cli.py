@@ -1,6 +1,6 @@
 """Operator CLI `fw` (F19): a thin wrapper over the admin API.
 
-Tier 1 subcommands: grant create | list | revoke, approvals list, approve, deny.
+Subcommands: grant create | list | revoke, approvals list, approve, deny, pins list | approve, audit verify | tail.
 Env: FW_ADMIN_TOKEN (required), FW_ADMIN_URL (default http://127.0.0.1:8801).
 Run as: uv run fw ...   (or: uv run python -m firewall.cli ...)
 """
@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap = sub.add_parser("approvals").add_subparsers(dest="sub", required=True)
     lst = ap.add_parser("list")
     lst.add_argument("--status", default="pending")
+    au = sub.add_parser("audit").add_subparsers(dest="sub", required=True)
+    au.add_parser("verify", help="check the audit hash chain and the checkpoint file")
+    tail = au.add_parser("tail", help="show the newest audit rows")
+    tail.add_argument("--limit", type=int, default=20)
+
     pins = sub.add_parser("pins").add_subparsers(dest="sub", required=True)
     pins.add_parser("list")
     pa = pins.add_parser("approve", help="adopt the observed definition of a changed or quarantined tool")
@@ -103,6 +108,20 @@ def main(argv: list[str] | None = None) -> int:
             print("no approvals")
         for r in rows:
             print(f"{r['id']}  {r['status']:<9} grant={r['grant_id']} tool={r['tool']} reasons={r['reason_codes']}")
+            p = r.get("preview")
+            if p:  # what the operator is being asked to approve: destination, private matches and the content
+                print(f"    destination: {p.get('destination') or '-'}   private matches: {p.get('private_matches', 0)}")
+                print("    content: " + (p["preview"] if p.get("preview_available") else "(preview unavailable)"))
+    elif a.cmd == "audit" and a.sub == "verify":
+        result = _call("GET", "/audit/verify")
+        if result["ok"]:
+            print(f"audit chain OK: {result['rows']} rows, {result['checkpoints_checked']} checkpoints checked")
+        else:
+            print(f"AUDIT CHAIN BROKEN: {result['error']}", file=sys.stderr)
+            return 1
+    elif a.cmd == "audit" and a.sub == "tail":
+        for r in reversed(_call("GET", "/audit", params={"limit": a.limit})):
+            print(f"#{r['id']} {r['ts']} {r['phase']:<7} {r['verdict']:<18} {r['tool'] or '-'} {r['reason_code'] or ''}")
     elif a.cmd == "pins" and a.sub == "list":
         rows = _call("GET", "/pins")
         print(f"{'tool':<18} {'state':<16} first_seen            reasons")

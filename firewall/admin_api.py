@@ -17,16 +17,22 @@ from pathlib import Path
 from typing import Literal
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from firewall import audit, grants, policy
+from firewall import approvals, audit, grants, policy, sessions
 from firewall.config import PolicyConfig, config_version, load_policy, load_tools
 from firewall.models import GrantState
 from firewall.registry import Registry
 from firewall.store import Store, iso, utcnow
 
 ROOT = Path(__file__).resolve().parents[1]
+DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
+DASHBOARD_FILES = ("index.html", "app.js", "style.css")
+# No inline script or style, no external hosts, no framing, no form posts: the page can only talk to its own origin.
+DASHBOARD_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; "
+                 "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 MIN_TOKEN_LEN = 16
 FAIL_LIMIT = 5
 FAIL_WINDOW_S = 60.0
@@ -95,10 +101,24 @@ def check_admin_token(token: str | None) -> str:
 
 def create_admin_app(store: Store, registry: Registry, policy_cfg: PolicyConfig, admin_token: str | None,
                      mode: str = "enforce", version: str = "", operator: str = "operator",
-                     limiter: LoginLimiter | None = None) -> FastAPI:
+                     limiter: LoginLimiter | None = None, approval_crypto: approvals.ApprovalCrypto | None = None,
+                     checkpoint_path: str | None = None) -> FastAPI:
     token = check_admin_token(admin_token)
     limiter = limiter or LoginLimiter()
     app = FastAPI(title="Agent Firewall admin", docs_url=None, redoc_url=None, openapi_url=None)
+    assets = {name: (DASHBOARD_DIR / name).read_text(encoding="utf-8") for name in DASHBOARD_FILES}
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        """No CORS headers are ever added. Dashboard pages get a strict Content-Security-Policy (no inline script,
+        no external hosts); everything else may not be framed or sniffed."""
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = (
+            DASHBOARD_CSP if request.url.path.startswith("/dashboard") else "default-src 'none'; frame-ancestors 'none'")
+        return response
 
     async def admin_audit(action: str, grant_id: str | None = None, **detail) -> None:
         await audit.write(store, {"phase": "admin", "verdict": "allow", "tool": action, "grant_id": grant_id,
@@ -121,9 +141,17 @@ def create_admin_app(store: Store, registry: Registry, policy_cfg: PolicyConfig,
     def grant_view(g) -> dict:
         return asdict(g)  # never contains the token or its hash, only the masked prefix
 
+    async def effective_mode() -> str:
+        """The mode the gateway actually runs in (it records it in the shared database at startup)."""
+        return await store.get_runtime("mode") or mode
+
     @app.get("/health", dependencies=auth)
     async def health():
-        return {"status": "ok", "mode": mode, "monitor_banner": mode == "monitor", "config_version": version}
+        m = await effective_mode()
+        return {"status": "ok", "mode": m, "monitor_banner": m == "monitor", "config_version": version,
+                "approvals_enabled": bool(await store.get_runtime("approvals_enabled")),
+                "approval_mode": await store.get_runtime("approval_mode"),
+                "selftest": await store.get_runtime("selftest")}
 
     @app.post("/grants", dependencies=auth, status_code=201)
     async def create_grant(body: GrantRequest):
@@ -136,7 +164,12 @@ def create_admin_app(store: Store, registry: Registry, policy_cfg: PolicyConfig,
 
     @app.get("/grants", dependencies=auth)
     async def list_grants():
-        return [grant_view(g) for g in await grants.list_grants(store)]
+        out = []
+        for g in (await grants.list_grants(store))[:200]:
+            st = await sessions.load_state(store, g.id)
+            out.append({**grant_view(g), "suspended": st.suspended, "suspicious": st.suspicious,
+                        "labels": sorted(st.labels)})
+        return out
 
     @app.get("/grants/{grant_id}", dependencies=auth)
     async def get_grant(grant_id: str):
@@ -147,8 +180,6 @@ def create_admin_app(store: Store, registry: Registry, policy_cfg: PolicyConfig,
         return {**grant_view(g), "state": state}
 
     async def _state(grant_id: str) -> dict:
-        from firewall import sessions
-
         s = await sessions.load_state(store, grant_id)
         return {"labels": sorted(s.labels), "suspicious": s.suspicious, "suspended": s.suspended,
                 "denied_streak": s.denied_streak, "call_count": s.call_count}
@@ -170,19 +201,52 @@ def create_admin_app(store: Store, registry: Registry, policy_cfg: PolicyConfig,
 
     @app.get("/approvals", dependencies=auth)
     async def list_approvals(status: str | None = None, limit: int = 100):
-        return await store.list_approvals(status, min(max(limit, 1), 1000))
+        await store.sweep_expired_approvals(iso(utcnow()))  # expired rows lose their stored arguments here too
+        rows = await store.list_approvals(status, min(max(limit, 1), 1000), with_args=True)
+        out = []
+        for r in rows:
+            view = {k: v for k, v in r.items() if k != "args_encrypted"}
+            view["reason_codes"] = json.loads(r["reason_codes"] or "[]")
+            view["detail"] = json.loads(r.get("detail") or "{}")
+            if r["status"] == "pending":
+                view["preview"] = approvals.preview(approval_crypto, r)
+            out.append(view)
+        return out
 
     @app.post("/approvals/{approval_id}/decision", dependencies=auth)
     async def decide(approval_id: str, body: DecisionRequest):
         outcome = await store.decide_approval(approval_id, body.decision, body.scope, operator, iso(utcnow()))
         if outcome == "not_found":
             raise HTTPException(404, {"error": "approval not found"})
+        if outcome == "no_destination":
+            raise HTTPException(422, {"error": "scope 'destination' needs a call with exactly one destination"})
         if outcome in ("conflict", "expired"):
             raise HTTPException(409, {"error": "approval already decided" if outcome == "conflict" else "approval expired"})
         await admin_audit("POST /approvals/decision", None, approval_id=approval_id, decision=body.decision,
                           scope=body.scope)
         return {"id": approval_id, "status": "approved" if body.decision == "approve" else "denied"}
 
+    @app.get("/sessions", dependencies=auth)
+    async def list_sessions():
+        return (await store.list_sessions())[:200]
+
+    @app.get("/audit/verify", dependencies=auth)
+    async def verify_audit():
+        return await audit.verify_chain(store, checkpoint_path)
+
+    # The dashboard files are static and contain no data, so they need no token (a browser cannot send a custom
+    # header when it loads a page). Every data route above still requires X-Admin-Token.
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard():
+        return HTMLResponse(assets["index.html"])
+
+    @app.get("/dashboard/app.js")
+    async def dashboard_js():
+        return Response(assets["app.js"], media_type="text/javascript")
+
+    @app.get("/dashboard/style.css")
+    async def dashboard_css():
+        return Response(assets["style.css"], media_type="text/css")
     @app.get("/pins", dependencies=auth)
     async def list_pins():
         pins = await store.list_pins()
@@ -221,10 +285,15 @@ async def amain() -> None:
     try:
         policy_cfg = load_policy(ROOT / "policy.yaml")
         registry = Registry(load_tools(ROOT / "tools.yaml"))
-        store = await Store(os.environ.get("FW_DB_PATH", "./fw.db")).open()
+        db = os.environ.get("FW_DB_PATH", "./fw.db")
+        store = await Store(db).open()
         mode = os.environ.get("FW_MODE") or policy_cfg.defaults.mode
+        key = os.environ.get("FW_APPROVAL_KEY")
+        crypto = approvals.ApprovalCrypto(key) if key else None  # without it the preview of pending calls is unavailable
         app = create_admin_app(store, registry, policy_cfg, os.environ.get("FW_ADMIN_TOKEN"), mode,
-                               config_version(ROOT / "policy.yaml", ROOT / "tools.yaml", ROOT / "upstreams.yaml"))
+                               config_version(ROOT / "policy.yaml", ROOT / "tools.yaml", ROOT / "upstreams.yaml"),
+                               approval_crypto=crypto,
+                               checkpoint_path=os.environ.get("FW_AUDIT_CHECKPOINT") or audit.checkpoint_path_for(db))
     except Exception as exc:
         print(f"refusing to start: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

@@ -77,7 +77,7 @@ async def test_f19_approvals_list_approve_deny(admin, capsys):
     store, _ = admin
     for aid in ("ap_a", "ap_b"):
         await store.insert_approval({"id": aid, "grant_id": "g_1", "tool": "mail_send_email", "args_hash": "h",
-                                     "reason_codes": ["TRIFECTA_APPROVAL"], "created_at": iso(utcnow()),
+                                     "reason_codes": ["TRIFECTA_APPROVAL"], "destination": "docs.example.com", "created_at": iso(utcnow()),
                                      "expires_at": "2099-01-01T00:00:00+00:00"})
     await run_cli("approvals", "list")
     out = capsys.readouterr().out

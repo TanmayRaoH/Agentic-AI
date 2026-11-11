@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Firewall</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div id="banner" class="banner hidden" role="alert"></div>
+  <header>
+    <h1>Agent Firewall</h1>
+    <div class="connect">
+      <label for="token">Admin token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false">
+      <button id="connect" type="button">Connect</button>
+      <span id="status" class="status"></span>
+    </div>
+  </header>
+  <main>
+    <section id="counters" class="counters" aria-label="Counters"></section>
+    <section class="panel wide">
+      <h2>Pending approvals</h2>
+      <div id="approvals" class="list"></div>
+    </section>
+    <section class="panel">
+      <h2>Grants</h2>
+      <div id="grants" class="list"></div>
+    </section>
+    <section class="panel">
+      <h2>Tool pins</h2>
+      <div id="pins" class="list"></div>
+    </section>
+    <section class="panel wide">
+      <h2>Audit feed</h2>
+      <div class="filters">
+        <label for="filter">Filter</label>
+        <select id="filter">
+          <option value="">all verdicts</option>
+          <option value="allow">allow</option>
+          <option value="deny">deny</option>
+          <option value="would_deny">would_deny</option>
+          <option value="require_approval">require_approval</option>
+          <option value="quarantine">quarantine</option>
+          <option value="flag">flag</option>
+        </select>
+      </div>
+      <div id="audit" class="list"></div>
+    </section>
+  </main>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>
